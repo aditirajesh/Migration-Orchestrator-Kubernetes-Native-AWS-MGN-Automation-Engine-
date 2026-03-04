@@ -1,7 +1,7 @@
 
 ### It is a distributed state machine where each server that needs to be migrated moves through well-defined states, with jobs executed by workers and their states tracked in a central database. 
 
-![[img1.png]]                                                   Architecture with AWS Services
+![Architecture with AWS Services](../Images/img1.png)
 
 ### The Core Problem:
 - The main problem with current migrations is that it is a multi-step, multi-hour process involving multiple external APIs, human interventions. 
@@ -49,11 +49,11 @@ This architecture aims to solve all these problems.
 
 
 ## Implementation:
-![[img2.png]]
+![Implementation diagram](../Images/img2.png)
 
 
 
-![[img3.png]]                                     Architecture w/ Portable alternative
+![Architecture with Portable Alternative](../Images/img3.png)
 
 
 

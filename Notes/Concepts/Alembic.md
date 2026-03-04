@@ -32,7 +32,7 @@ When an upgrade command is read, this version table is read and if the upgrade i
 ## How does alembic work with postgres image?
 Postgres image is referenced in the statefulset -> to create a database in kubernetes. The actual data is present in the running container which has a network connection, and this data either lives in the container runtime or in the PVC attached to the statefulset. In this case, nothing is baked into the image. 
 
-![[Pasted image 20260225140655.png]]
+![Alembic workflow with PostgreSQL](../Images/Pasted%20image%2020260225140655.png)
 
 ## How do we see the actual table of servers then
 Couple of alternatives exist:
