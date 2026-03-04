@@ -1,0 +1,21 @@
+  # k8s/rabbitmq/configmap.yaml
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: rabbitmq-config
+    namespace: migration-orchestrator
+  data:
+    #5672 port where the workers will listen to the queues for jobs
+    #15672 separate port for the rabbitmq web admin.
+    #loopback_users is set to false to have connections inside the cluster
+    #rabbitmq_peer_discovery_k8s: used to help nodes auto-discover one another
+    rabbitmq.conf: |
+      loopback_users.guest = false 
+      listeners.tcp.default = 5672 
+      management.tcp.port = 15672 
+      default_vhost = /
+      vm_memory_high_watermark.absolute = 256MiB
+      disk_free_limit.absolute = 1GB
+
+    enabled_plugins: |
+      [rabbitmq_management,rabbitmq_peer_discovery_k8s].

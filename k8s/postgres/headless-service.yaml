@@ -1,0 +1,21 @@
+# k8s/postgres/headless-service.yaml
+#
+# Provides stable DNS for the StatefulSet pod.
+# The pod is reachable at:
+#   postgres-0.postgres-headless.migration-orchestrator.svc.cluster.local
+#
+# Required by StatefulSet (serviceName field must reference a headless service).
+# Also useful if PostgreSQL is ever scaled to a read-replica cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: migration-orchestrator
+spec:
+  clusterIP: None       # headless — no virtual IP, DNS resolves directly to pod IP
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432

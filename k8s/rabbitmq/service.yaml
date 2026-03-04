@@ -1,0 +1,16 @@
+  # k8s/rabbitmq/service.yaml
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: rabbitmq
+    namespace: migration-orchestrator
+  spec:
+    selector:
+      app: rabbitmq
+    ports:
+      - name: amqp
+        port: 5672
+        targetPort: 5672
+      - name: management
+        port: 15672
+        targetPort: 15672

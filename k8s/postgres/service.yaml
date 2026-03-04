@@ -1,0 +1,20 @@
+# k8s/postgres/service.yaml
+#
+# Stable virtual IP for all clients (workers, API, Alembic Job) inside the cluster.
+# Workers connect using:
+#   DATABASE_URL=postgresql://admin:changeme@postgres.migration-orchestrator.svc.cluster.local:5432/migration_orchestrator
+#
+# This service does not change even if the postgres-0 pod is rescheduled to a
+# different node — Kubernetes updates the routing automatically.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: migration-orchestrator
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432

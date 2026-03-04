@@ -1,0 +1,88 @@
+ # k8s/rabbitmq/statefulset.yaml
+  apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    name: rabbitmq
+    namespace: migration-orchestrator
+  spec:
+    serviceName: rabbitmq-headless    # must match the headless service name
+    replicas: 1                       # start single-node, scale later
+    selector:
+      matchLabels:
+        app: rabbitmq
+    template:
+      metadata:
+        labels:
+          app: rabbitmq
+      spec:
+        containers:
+          - name: rabbitmq
+            image: rabbitmq:3.12-management
+            ports:
+              - containerPort: 5672
+                name: amqp
+              - containerPort: 15672
+                name: management
+            env:
+              - name: RABBITMQ_DEFAULT_USER
+                valueFrom:
+                  secretKeyRef:
+                    name: rabbitmq-secret
+                    key: username
+              - name: RABBITMQ_DEFAULT_PASS
+                valueFrom:
+                  secretKeyRef:
+                    name: rabbitmq-secret
+                    key: password
+              - name: RABBITMQ_ERLANG_COOKIE
+                valueFrom:
+                  secretKeyRef:
+                    name: rabbitmq-secret
+                    key: erlang-cookie
+              - name: RABBITMQ_NODE_NAME
+                value: "rabbit@$(POD_NAME).rabbitmq-headless.migration-orchestrator.svc.cluster.local"
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+            volumeMounts:
+              - name: rabbitmq-data
+                mountPath: /var/lib/rabbitmq
+              - name: config-volume
+                mountPath: /etc/rabbitmq/rabbitmq.conf
+                subPath: rabbitmq.conf
+              - name: config-volume
+                mountPath: /etc/rabbitmq/enabled_plugins
+                subPath: enabled_plugins
+            livenessProbe:
+              exec:
+                command: ["rabbitmq-diagnostics", "-q", "ping"]
+              initialDelaySeconds: 60
+              periodSeconds: 30
+              timeoutSeconds: 10
+            readinessProbe:
+              exec:
+                command: ["rabbitmq-diagnostics", "-q", "check_running"]
+              initialDelaySeconds: 30
+              periodSeconds: 15
+              timeoutSeconds: 10
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "250m"
+              limits:
+                memory: "512Mi"
+                cpu: "500m"
+        volumes:
+          - name: config-volume
+            configMap:
+              name: rabbitmq-config
+
+    volumeClaimTemplates:             # <-- this is the key StatefulSet feature
+      - metadata:
+          name: rabbitmq-data
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
