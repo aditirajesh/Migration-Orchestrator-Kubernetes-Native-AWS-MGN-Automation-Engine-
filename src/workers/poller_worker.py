@@ -7,6 +7,7 @@ from aio_pika import IncomingMessage, Message, DeliveryMode
 from dispatcher.job_types import JobType, QUEUE_ROUTING
 from workers.poll_result import PollResult, PollStatus
 from workers.state_manager_client import StateManagerClient
+from workers.aws_clients import get_mgn_client
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class PollerWorker:
         self._state_manager = state_manager
         self._connection = None
         self._channel = None
+        self._mgn = get_mgn_client()
 
         # Dispatch table: maps each poll job type to its handler function.
         # Adding a new poll type only requires adding an entry here and
@@ -187,72 +189,194 @@ class PollerWorker:
 
     async def _poll_replication_status(self, payload: dict) -> PollResult:
         """
-        Checks MGN replication state for the source server.
-        Advances to READY_FOR_TESTING when replication lag reaches zero
-        and MGN reports the server as ready.
+        Polls MGN until the source server is ready for test launch.
+        MGN reports READY_FOR_TEST once replication lag reaches zero and
+        the initial sync is complete.
 
-        AWS call: mgn_client.describe_source_servers(filters={"sourceServerIDs": [server_id]})
-        Complete when: lifecycleState == "READY_FOR_TEST"
-        Failed when:   lifecycleState == "DISCONNECTED" or "CUTOVER_COMPLETE"
+        AWS call: mgn.describe_source_servers
+        Complete when: lifeCycle.state == "READY_FOR_TEST" → READY_FOR_TESTING
+        Failed when:   lifeCycle.state == "DISCONNECTED"
         """
-        # TODO: replace with real MGN API call
-        server_id = payload["server_id"]
-        logger.debug("[poller] Polling replication status for %s", server_id)
-        return PollResult.in_progress()
+        server_id            = payload["server_id"]
+        aws_source_server_id = payload["aws_source_server_id"]
+
+        try:
+            response = self._mgn.describe_source_servers(
+                filters={"sourceServerIDs": [aws_source_server_id]}
+            )
+            items = response.get("items", [])
+
+            if not items:
+                return PollResult.failed(f"Server {aws_source_server_id} not found in MGN")
+
+            lifecycle_state = items[0].get("lifeCycle", {}).get("state", "")
+            logger.debug("[poller] Replication lifecycle for %s: %s", server_id, lifecycle_state)
+
+            if lifecycle_state == "READY_FOR_TEST":
+                return PollResult.complete(new_state="READY_FOR_TESTING")
+            elif lifecycle_state == "DISCONNECTED":
+                return PollResult.failed(
+                    f"Server {aws_source_server_id} disconnected during replication"
+                )
+            else:
+                return PollResult.in_progress()
+
+        except Exception as e:
+            return PollResult.failed(f"MGN describe_source_servers error: {e}")
 
     async def _poll_test_instance_status(self, payload: dict) -> PollResult:
         """
-        Checks EC2 instance state for the launched test instance.
-        Advances to TEST_INSTANCE_RUNNING when the instance reaches 'running'.
+        Polls the MGN job created by start_test until the test instance is running.
+        When complete, advances through TEST_INSTANCE_RUNNING and immediately sets
+        the AWAITING_TEST_VALIDATION gate so an engineer can validate the instance.
 
-        AWS call: ec2_client.describe_instances(InstanceIds=[instance_id])
-        Complete when: State.Name == "running"
-        Failed when:   State.Name in ("terminated", "shutting-down")
+        AWS call: mgn.describe_jobs
+        Complete when: job.status == "COMPLETED"
+        Failed when:   job.status in ("FAILED", "PARTIALLY_COMPLETED")
         """
-        # TODO: replace with real EC2 API call
-        server_id   = payload["server_id"]
-        instance_id = payload.get("test_instance_id")
-        logger.debug("[poller] Polling test instance %s for server %s", instance_id, server_id)
-        return PollResult.in_progress()
+        server_id  = payload["server_id"]
+        mgn_job_id = payload.get("mgn_job_id")
+
+        if not mgn_job_id:
+            return PollResult.failed("No mgn_job_id in payload for test instance poll")
+
+        try:
+            response = self._mgn.describe_jobs(filters={"jobIDs": [mgn_job_id]})
+            items    = response.get("items", [])
+
+            if not items:
+                return PollResult.failed(f"MGN job {mgn_job_id} not found")
+
+            status = items[0].get("status", "")
+            logger.debug("[poller] Test launch job %s status: %s", mgn_job_id, status)
+
+            if status == "COMPLETED":
+                # Record that the instance is running, then immediately move to the
+                # human validation gate. TEST_INSTANCE_RUNNING has no automated work
+                # to do — it exists to mark the moment in the audit trail.
+                await self._state_manager.advance_state(
+                    server_id, "TEST_INSTANCE_RUNNING", job_type="poll_test_instance_status"
+                )
+                return PollResult.complete(new_state="AWAITING_TEST_VALIDATION")
+
+            elif status in ("FAILED", "PARTIALLY_COMPLETED"):
+                return PollResult.failed(
+                    f"MGN test launch job {mgn_job_id} ended with status: {status}"
+                )
+            else:
+                return PollResult.in_progress()
+
+        except Exception as e:
+            return PollResult.failed(f"MGN describe_jobs error: {e}")
 
     async def _poll_cutover_sync_status(self, payload: dict) -> PollResult:
         """
-        Checks MGN final replication sync status before the cutover instance
-        is launched. MGN must complete the final delta sync before launch.
-        Advances to READY_FOR_CUTOVER_LAUNCH when sync is confirmed complete.
+        Polls the MGN job created by start_cutover until the final sync and
+        cutover instance launch are complete. MGN performs a last replication
+        delta before launching the cutover instance — this job covers both.
 
-        AWS call: mgn_client.describe_source_servers(...)
-        Complete when: lifecycleState == "CUTOVER" and finalLaunch is ready
+        AWS call: mgn.describe_jobs
+        Complete when: job.status == "COMPLETED" → READY_FOR_CUTOVER_LAUNCH
+        Failed when:   job.status in ("FAILED", "PARTIALLY_COMPLETED")
         """
-        # TODO: replace with real MGN API call
-        server_id = payload["server_id"]
-        logger.debug("[poller] Polling cutover sync status for %s", server_id)
-        return PollResult.in_progress()
+        server_id  = payload["server_id"]
+        mgn_job_id = payload.get("mgn_job_id")
+
+        if not mgn_job_id:
+            return PollResult.failed("No mgn_job_id in payload for cutover sync poll")
+
+        try:
+            response = self._mgn.describe_jobs(filters={"jobIDs": [mgn_job_id]})
+            items    = response.get("items", [])
+
+            if not items:
+                return PollResult.failed(f"MGN job {mgn_job_id} not found")
+
+            status = items[0].get("status", "")
+            logger.debug("[poller] Cutover sync job %s status: %s", mgn_job_id, status)
+
+            if status == "COMPLETED":
+                return PollResult.complete(new_state="READY_FOR_CUTOVER_LAUNCH")
+            elif status in ("FAILED", "PARTIALLY_COMPLETED"):
+                return PollResult.failed(
+                    f"MGN cutover job {mgn_job_id} ended with status: {status}"
+                )
+            else:
+                return PollResult.in_progress()
+
+        except Exception as e:
+            return PollResult.failed(f"MGN describe_jobs error: {e}")
 
     async def _poll_cutover_instance_status(self, payload: dict) -> PollResult:
         """
-        Checks EC2 instance state for the launched cutover (production) instance.
-        Advances to CUTOVER_INSTANCE_RUNNING when the instance reaches 'running'.
+        Polls MGN until the cutover instance reaches the CUTOVER lifecycle state,
+        confirming it is fully running. Then immediately sets the
+        AWAITING_CUTOVER_VALIDATION gate for engineer sign-off.
 
-        AWS call: ec2_client.describe_instances(InstanceIds=[instance_id])
-        Complete when: State.Name == "running"
-        Failed when:   State.Name in ("terminated", "shutting-down")
+        AWS call: mgn.describe_source_servers
+        Complete when: lifeCycle.state == "CUTOVER" → CUTOVER_INSTANCE_RUNNING → AWAITING_CUTOVER_VALIDATION
+        Failed when:   lifeCycle.state == "DISCONNECTED"
         """
-        # TODO: replace with real EC2 API call
-        server_id   = payload["server_id"]
-        instance_id = payload.get("cutover_instance_id")
-        logger.debug("[poller] Polling cutover instance %s for server %s", instance_id, server_id)
-        return PollResult.in_progress()
+        server_id            = payload["server_id"]
+        aws_source_server_id = payload["aws_source_server_id"]
+
+        try:
+            response = self._mgn.describe_source_servers(
+                filters={"sourceServerIDs": [aws_source_server_id]}
+            )
+            items = response.get("items", [])
+
+            if not items:
+                return PollResult.failed(f"Server {aws_source_server_id} not found in MGN")
+
+            lifecycle_state = items[0].get("lifeCycle", {}).get("state", "")
+            logger.debug("[poller] Cutover instance lifecycle for %s: %s", server_id, lifecycle_state)
+
+            if lifecycle_state == "CUTOVER":
+                await self._state_manager.advance_state(
+                    server_id, "CUTOVER_INSTANCE_RUNNING", job_type="poll_cutover_instance_status"
+                )
+                return PollResult.complete(new_state="AWAITING_CUTOVER_VALIDATION")
+            elif lifecycle_state == "DISCONNECTED":
+                return PollResult.failed(
+                    f"Server {aws_source_server_id} unexpectedly disconnected during cutover"
+                )
+            else:
+                return PollResult.in_progress()
+
+        except Exception as e:
+            return PollResult.failed(f"MGN describe_source_servers error: {e}")
 
     async def _poll_disconnect_status(self, payload: dict) -> PollResult:
         """
-        Checks whether the source server has fully disconnected from MGN
-        after finalize_cutover. Advances to DISCONNECTED once confirmed.
+        Polls MGN until the source server is fully disconnected from replication.
+        Once confirmed, advances through DISCONNECTED and immediately moves to the
+        AWAITING_ARCHIVE_APPROVAL gate so an engineer can approve archiving.
 
-        AWS call: mgn_client.describe_source_servers(...)
-        Complete when: lifecycleState == "DISCONNECTED"
+        AWS call: mgn.describe_source_servers
+        Complete when: lifeCycle.state == "DISCONNECTED" (or server absent from MGN)
         """
-        # TODO: replace with real MGN API call
-        server_id = payload["server_id"]
-        logger.debug("[poller] Polling disconnect status for %s", server_id)
-        return PollResult.in_progress()
+        server_id            = payload["server_id"]
+        aws_source_server_id = payload["aws_source_server_id"]
+
+        try:
+            response = self._mgn.describe_source_servers(
+                filters={"sourceServerIDs": [aws_source_server_id]}
+            )
+            items = response.get("items", [])
+
+            if items:
+                lifecycle_state = items[0].get("lifeCycle", {}).get("state", "")
+                logger.debug("[poller] Disconnect lifecycle for %s: %s", server_id, lifecycle_state)
+
+                if lifecycle_state != "DISCONNECTED":
+                    return PollResult.in_progress()
+
+            # Either MGN confirms DISCONNECTED or the server is absent (already removed).
+            await self._state_manager.advance_state(
+                server_id, "DISCONNECTED", job_type="poll_disconnect_status"
+            )
+            return PollResult.complete(new_state="AWAITING_ARCHIVE_APPROVAL")
+
+        except Exception as e:
+            return PollResult.failed(f"MGN describe_source_servers error: {e}")

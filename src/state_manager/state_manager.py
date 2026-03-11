@@ -181,3 +181,29 @@ class StateManager:
                     triggered_by,
                     json.dumps(metadata) if metadata is not None else None,
                 )
+
+    # ------------------------------------------------------------------ #
+    #  Server Attribute Updates                                            #
+    # ------------------------------------------------------------------ #
+
+    async def set_aws_source_server_id(
+        self, server_id: str, aws_source_server_id: str
+    ) -> None:
+        """
+        Stores the AWS MGN source server ID against the server record.
+        Called by the ADD_SERVER handler after confirming the server exists in MGN.
+        Raises ValueError if the server does not exist.
+        """
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE servers
+                SET aws_source_server_id = $1,
+                    updated_at           = now()
+                WHERE server_id = $2
+                """,
+                aws_source_server_id,
+                server_id,
+            )
+        if result == "UPDATE 0":
+            raise ValueError(f"Server '{server_id}' not found")

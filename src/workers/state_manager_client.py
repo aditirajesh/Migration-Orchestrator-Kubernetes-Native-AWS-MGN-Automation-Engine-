@@ -50,6 +50,12 @@ class StateManagerClient:
         current_state = await self.get_server_state(server_id)
         return current_state == expected_state
 
+    async def set_aws_source_server_id(
+        self, server_id: str, aws_source_server_id: str
+    ) -> None:
+        """Stores the AWS MGN source server ID on the server record."""
+        await self._sm.set_aws_source_server_id(server_id, aws_source_server_id)
+
     async def advance_state(
         self,
         server_id: str,
