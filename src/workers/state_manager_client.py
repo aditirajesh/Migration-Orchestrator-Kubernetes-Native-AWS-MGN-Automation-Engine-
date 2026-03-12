@@ -38,6 +38,10 @@ class StateManagerClient:
         """Returns the current state of the server from the database."""
         return await self._sm.get_server_state(server_id)
 
+    async def get_server(self, server_id: str) -> dict:
+        """Returns the full server row as a dict. Raises ValueError if not found."""
+        return await self._sm.get_server(server_id)
+
     async def is_poll_valid(self, server_id: str, job_type: JobType) -> bool:
         """
         Returns True if the server is in the expected state for this poll job.

@@ -16,6 +16,7 @@ Migrating servers to AWS with MGN involves a long sequence of steps across multi
 - Enforces state machine rules so no server can skip steps or move backwards
 - Pauses automatically at human approval gates (replication review, launch template review, test validation, cutover validation, archive and cleanup confirmation)
 - Polls long-running AWS operations (replication sync, instance launch) asynchronously without blocking
+- Runs pre-flight replication health checks before test and cutover launches to prevent partial data copies
 - Rolls back automatically when a job fails, landing the server in a known clean state
 - Maintains a complete, immutable audit trail of every state transition — who triggered it, which job caused it, and when it happened
 
@@ -29,17 +30,23 @@ Migrating servers to AWS with MGN involves a long sequence of steps across multi
                         │      (FastAPI)        │
                         └──────────┬──────────┘
                                    │
-                    ┌──────────────▼──────────────┐
-                    │         RabbitMQ             │
-                    │  mgn_jobs  poll_jobs         │
-                    │  rollback_jobs   dlx.*       │
-                    └──────┬──────────┬────────────┘
-                           │          │
-               ┌───────────▼──┐  ┌────▼───────────┐
+                    ┌──────────────▼──────────────────┐
+                    │            RabbitMQ              │
+                    │  mgn_jobs        poll_jobs       │
+                    │      │               │           │
+                    │  [dlx.migration exchange]        │
+                    │      │               │           │
+                    │  mgn_jobs.failed  poll_jobs.failed│
+                    └──────┬───────────────┬───────────┘
+                           │               │
+               ┌───────────▼──┐  ┌─────────▼──────┐
                │  MGN Worker  │  │  Poller Worker  │
-               │              │  │                 │
                └───────┬──────┘  └────────┬────────┘
-                       │                  │
+                       │                  │         \
+                       │                  │    ┌─────▼──────────┐
+                       │                  │    │ Rollback Worker │
+                       │                  │    │ (mgn+poll.failed│
+                       │                  │    └─────────────────┘
                ┌───────▼──────────────────▼────────┐
                │           State Manager            │
                │     (PostgreSQL — single source    │
@@ -48,13 +55,13 @@ Migrating servers to AWS with MGN involves a long sequence of steps across multi
                └───────────────────────────────────┘
 ```
 
-**MGN Worker** — executes migration actions by calling AWS MGN and EC2 APIs (agent install, replication setup, instance launch, cutover, cleanup).
+**MGN Worker** — executes migration actions by calling AWS MGN APIs across all 13 job types (replication setup, test launch, cutover, cleanup). Includes pre-flight replication health checks before test and cutover launches.
 
-**Poller Worker** — monitors long-running AWS operations and advances server state when they complete.
+**Poller Worker** — monitors long-running AWS operations via MGN job and lifecycle state polling. Re-enqueues itself until operations complete, then advances server state.
 
-**Rollback Worker** — consumes from dead-letter queues, undoes completed steps in reverse order, and transitions servers to `FAILED` (clean state) or `FROZEN` (unknown state, human intervention required).
+**Rollback Worker** — consumes from `mgn_jobs.failed` and `poll_jobs.failed`. Executes the minimum AWS undo actions for the server's current state, then marks it `FAILED` (clean, recoverable) or `FROZEN` (unknown state, human intervention required).
 
-**Orchestrator API** — FastAPI service for engineers to register servers, resolve approval gates, monitor migration progress, and manually intervene on failed servers.
+**Orchestrator API** — FastAPI service for engineers to register servers, resolve approval gates, monitor migration progress, and query servers in error states.
 
 ---
 
@@ -75,7 +82,7 @@ Human gates (AWAITING_*):   replication approval, test launch approval,
 
 Error states:
   FAILED  — job failed, rollback succeeded, server in known clean state
-  FROZEN  — rollback failed, server in unknown state, human must intervene
+  FROZEN  — rollback failed or cutover committed, human must intervene
 ```
 
 ---
@@ -89,7 +96,7 @@ Error states:
 | Workers | Python + asyncio + aio-pika | Async I/O for concurrent job processing without thread overhead |
 | DB access | asyncpg + Alembic | Async PostgreSQL driver, version-controlled schema migrations |
 | Orchestration | Kubernetes (kind for local) | Portable, production-grade deployment |
-| AWS integration | boto3 | MGN and EC2 API calls |
+| AWS integration | boto3 | MGN API calls across all migration stages |
 
 ---
 
@@ -97,18 +104,55 @@ Error states:
 
 ```
 k8s/
-  rabbitmq/     StatefulSet, services, secret, configmap
-  postgres/     StatefulSet, services, secret
+  rabbitmq/          StatefulSet, services, secret, configmap
+  postgres/          StatefulSet, services, secret
+  aws-credentials/   Kubernetes Secret for AWS STS credentials (placeholder)
+  iam/               IAM policy document for the worker role
 
 src/
-  dispatcher/   Job dispatch logic and job type definitions
-  workers/      Poller worker, MGN worker, Rollback worker
-  state_manager/  State machine definition, transition validator, DB operations
-  db/           Alembic migrations
+  dispatcher/        Job type definitions and queue routing
+  state_manager/     State machine (27 states, transition validator, DB operations)
+  workers/
+    mgn_worker.py       All 13 MGN job handlers + pre-flight checks
+    poller_worker.py    5 poll handlers (replication, test, cutover, disconnect)
+    rollback_worker.py  Undo logic mapped to every state, FAILED/FROZEN finalisation
+    aws_clients.py      boto3 client factory
+    state_manager_client.py  Worker-facing DB interface
+    run_mgn.py / run_poller.py / run_rollback.py  Entry points
+  db/                Alembic migrations (servers, state_transition_history)
 ```
+
+---
+
+## What Each Worker Publishes
+
+| Worker | Publishes to | When |
+|---|---|---|
+| MGN Worker | `poll_jobs` | After start_replication, start_test, start_cutover, disconnect |
+| MGN Worker | `mgn_jobs` | After finalize_cutover (dispatches DISCONNECT_SOURCE_SERVER) |
+| Poller Worker | `poll_jobs` | Re-enqueues itself when an operation is still in progress |
+| Rollback Worker | Nothing | Reads only — writes final state to PostgreSQL |
+
+---
+
+## RabbitMQ Dead-Letter Setup
+
+All three main queues (`mgn_jobs`, `poll_jobs`, `rollback_jobs`) are configured with `x-dead-letter-exchange=dlx.migration`. The `dlx.migration` exchange routes failed messages to isolated `.failed` queues (`mgn_jobs.failed`, `poll_jobs.failed`, `rollback_jobs.failed`). The Rollback Worker consumes from `mgn_jobs.failed` and `poll_jobs.failed` directly, preserving per-worker failure visibility.
 
 ---
 
 ## Status
 
-Active development. Core infrastructure complete (RabbitMQ, PostgreSQL, state machine, dispatcher, poller). MGN Worker, Rollback Worker, and Orchestrator API in progress.
+| Component | Status |
+|---|---|
+| PostgreSQL StatefulSet | Complete |
+| RabbitMQ StatefulSet + DLX | Complete |
+| State machine (27 states, transitions) | Complete |
+| Alembic migrations | Complete |
+| Job Dispatcher | Complete |
+| MGN Worker (all 13 handlers) | Complete |
+| Poller Worker (all 5 handlers) | Complete |
+| Rollback Worker | Complete |
+| Orchestrator API (FastAPI) | Pending |
+| Dockerfiles + k8s Deployments | Pending |
+| End-to-end test | Pending |

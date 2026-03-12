@@ -186,6 +186,27 @@ class MgnWorker:
         logger.info("[mgn] Dispatched follow-up %s for server %s", job_type.value, payload.get("server_id"))
 
     # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_lifecycle_state(self, aws_source_server_id: str) -> str:
+        """
+        Returns the MGN lifeCycle.state string for a source server.
+
+        Used by pre-flight checks before launching test or cutover instances
+        to verify replication is healthy before committing to a launch.
+
+        Raises ValueError if the server is not found in MGN.
+        """
+        response = self._mgn.describe_source_servers(
+            filters={"sourceServerIDs": [aws_source_server_id]}
+        )
+        items = response.get("items", [])
+        if not items:
+            raise ValueError(f"Server {aws_source_server_id} not found in MGN")
+        return items[0].get("lifeCycle", {}).get("state", "UNKNOWN")
+
+    # ------------------------------------------------------------------
     # Handlers
     #
     # Each handler receives the job payload and returns an MgnResult.
@@ -380,6 +401,19 @@ class MgnWorker:
         aws_source_server_id = payload["aws_source_server_id"]
 
         try:
+            # Pre-flight: verify replication is healthy before launching.
+            # MGN only marks a server READY_FOR_TEST when replication lag has
+            # reached zero and the last snapshot is consistent. Launching
+            # against any other state risks copying partial or stale data.
+            lifecycle_state = self._get_lifecycle_state(aws_source_server_id)
+            if lifecycle_state != "READY_FOR_TEST":
+                return MgnResult.failed(
+                    f"Pre-flight check failed for {aws_source_server_id}: "
+                    f"expected lifecycle state READY_FOR_TEST, got '{lifecycle_state}'. "
+                    f"Replication may be lagging, disconnected, or stopped — "
+                    f"aborting test launch to prevent partial data copy."
+                )
+
             response = self._mgn.start_test(sourceServerIDs=[aws_source_server_id])
             job_id   = response.get("job", {}).get("jobID")
 
@@ -473,6 +507,22 @@ class MgnWorker:
         aws_source_server_id = payload["aws_source_server_id"]
 
         try:
+            # Pre-flight: verify replication is healthy before cutover.
+            # READY_FOR_CUTOVER means the final continuous sync is up to date
+            # and MGN considers the server ready for production cutover.
+            # Any other state — especially DISCONNECTED, NOT_READY, or STOPPED
+            # — means the destination snapshot is behind the source. Cutting
+            # over in that condition would produce a production instance with
+            # missing or corrupted data.
+            lifecycle_state = self._get_lifecycle_state(aws_source_server_id)
+            if lifecycle_state != "READY_FOR_CUTOVER":
+                return MgnResult.failed(
+                    f"Pre-flight check failed for {aws_source_server_id}: "
+                    f"expected lifecycle state READY_FOR_CUTOVER, got '{lifecycle_state}'. "
+                    f"Replication may be lagging, disconnected, or stopped — "
+                    f"aborting cutover to prevent partial data copy."
+                )
+
             response = self._mgn.start_cutover(sourceServerIDs=[aws_source_server_id])
             job_id   = response.get("job", {}).get("jobID")
 
