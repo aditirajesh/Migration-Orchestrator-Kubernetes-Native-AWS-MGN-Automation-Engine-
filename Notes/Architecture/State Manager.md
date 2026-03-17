@@ -119,4 +119,4 @@ Some writes to the servers/ state transition history table are made through huma
   - notes — optional human comment
 
 
-![State machine database schema](../Images/img11.png)
+![[img11.png]]

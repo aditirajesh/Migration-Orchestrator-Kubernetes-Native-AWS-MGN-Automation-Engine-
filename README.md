@@ -61,7 +61,7 @@ Migrating servers to AWS with MGN involves a long sequence of steps across multi
 
 **Rollback Worker** — consumes from `mgn_jobs.failed` and `poll_jobs.failed`. Executes the minimum AWS undo actions for the server's current state, then marks it `FAILED` (clean, recoverable) or `FROZEN` (unknown state, human intervention required).
 
-**Orchestrator API** — FastAPI service for engineers to register servers, resolve approval gates, monitor migration progress, and query servers in error states.
+**Orchestrator API** — FastAPI service for engineers to register servers, resolve approval gates, monitor migration progress, query audit history, and manage batch (wave) migrations. Exposes 51 endpoints across per-server pipeline actions, bulk operations, batch management, and global history.
 
 ---
 
@@ -119,7 +119,16 @@ src/
     aws_clients.py      boto3 client factory
     state_manager_client.py  Worker-facing DB interface
     run_mgn.py / run_poller.py / run_rollback.py  Entry points
-  db/                Alembic migrations (servers, state_transition_history)
+  api/
+    main.py             FastAPI app + lifespan (DB pool, RabbitMQ connection)
+    models.py           Pydantic request/response models
+    dependencies.py     FastAPI dependency injection (StateManager, JobDispatcher)
+    routes/
+      servers.py        25 per-server endpoints + 2 bulk endpoints
+      batches.py        6 batch management endpoints + 17 batch pipeline action endpoints
+      history.py        GET /history — global audit trail with composable filters
+    run_api.py          uvicorn entry point
+  db/                Alembic migrations (servers, state_transition_history, batches)
 ```
 
 ---
@@ -141,6 +150,31 @@ All three main queues (`mgn_jobs`, `poll_jobs`, `rollback_jobs`) are configured 
 
 ---
 
+## Orchestrator API
+
+The API is the only external interface to the system. Engineers interact exclusively through it — no direct database access or queue publishing outside of the API and workers.
+
+**51 endpoints across four categories:**
+
+| Category | Count | Description |
+|---|---|---|
+| Per-server pipeline actions | 25 | Register, start, configure, approve/reject gates, reset |
+| Bulk operations | 2 | Bulk register (`POST /servers/bulk`), bulk start (`POST /servers/bulk-start`) — HTTP 207 Multi-Status, per-item results |
+| Batch management | 6 | Create batch, list, get, add servers, get servers, get audit history |
+| Batch pipeline actions | 17 | Same gate actions as per-server but applied to an entire wave simultaneously |
+| Global history | 1 | `GET /history` — composable filters across server, batch, state, engineer, job type, and time range |
+
+**Batch (wave) support:**
+Servers can be grouped into named batches and progressed through the pipeline together. A batch action iterates all servers in the wave and returns a three-way result — `succeeded` / `skipped` / `failed` — so one server falling behind does not block the rest. The three configure endpoints (`configure-replication`, `configure-test-launch`, `configure-cutover-launch`) store a JSONB config snapshot on the batch record as an audit reference.
+
+**Query filters:**
+`GET /servers` accepts four composable filters: `state`, `batch_id`, `assigned_engineer`, `hostname` (partial match). Use `batch_id=unassigned` to list servers not yet in any batch.
+
+**Schema additions for batch support:**
+Two Alembic migrations extend the original schema — `a3f9c12e8b47` adds `aws_account_id` and `aws_region` to `servers`; `b5e8d4a1c9f2` creates the `batches` table and adds a nullable `batch_id` FK to `servers` with `ON DELETE SET NULL`.
+
+---
+
 ## Status
 
 | Component | Status |
@@ -153,6 +187,6 @@ All three main queues (`mgn_jobs`, `poll_jobs`, `rollback_jobs`) are configured 
 | MGN Worker (all 13 handlers) | Complete |
 | Poller Worker (all 5 handlers) | Complete |
 | Rollback Worker | Complete |
-| Orchestrator API (FastAPI) | Pending |
+| Orchestrator API (FastAPI) | Complete |
 | Dockerfiles + k8s Deployments | Pending |
 | End-to-end test | Pending |

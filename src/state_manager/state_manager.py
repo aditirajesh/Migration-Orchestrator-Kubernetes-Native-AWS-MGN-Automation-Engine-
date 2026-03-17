@@ -41,25 +41,104 @@ class StateManager:
         server_id: str,
         hostname: str,
         ip_address: str,
+        aws_account_id: str | None = None,
+        aws_region: str | None = None,
         assigned_engineer: str | None = None,
+        batch_id: str | None = None,
     ) -> None:
         """
         Registers a new source server in the system.
         Initial state is always PENDING — the first step in the pipeline.
         Raises asyncpg.UniqueViolationError if server_id already exists.
+
+        aws_account_id and aws_region identify the target AWS environment.
+        Credentials themselves stay in the k8s secret — these are metadata only.
+        batch_id optionally assigns the server to a wave at registration time.
         """
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO servers (server_id, hostname, ip_address, current_state, assigned_engineer)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO servers
+                    (server_id, hostname, ip_address, current_state,
+                     aws_account_id, aws_region, assigned_engineer, batch_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
                 server_id,
                 hostname,
                 ip_address,
                 ServerState.PENDING.value,
+                aws_account_id,
+                aws_region,
                 assigned_engineer,
+                batch_id,
             )
+
+    # ------------------------------------------------------------------ #
+    #  Bulk Reads                                                          #
+    # ------------------------------------------------------------------ #
+
+    async def list_servers(
+        self,
+        state_filter: str | None = None,
+        batch_id: str | None = None,
+        assigned_engineer: str | None = None,
+        hostname: str | None = None,
+    ) -> list[dict]:
+        """
+        Returns all server rows, with composable optional filters.
+        Ordered by created_at descending so the newest registrations appear first.
+
+        batch_id='unassigned' is a sentinel that queries WHERE batch_id IS NULL.
+        """
+        conditions: list[str] = []
+        params: list = []
+
+        if state_filter:
+            params.append(state_filter)
+            conditions.append(f"current_state = ${len(params)}")
+
+        if batch_id is not None:
+            if batch_id == "unassigned":
+                conditions.append("batch_id IS NULL")
+            else:
+                params.append(batch_id)
+                conditions.append(f"batch_id = ${len(params)}")
+
+        if assigned_engineer:
+            params.append(assigned_engineer)
+            conditions.append(f"assigned_engineer = ${len(params)}")
+
+        if hostname:
+            params.append(f"%{hostname}%")
+            conditions.append(f"hostname ILIKE ${len(params)}")
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"SELECT * FROM servers {where} ORDER BY created_at DESC"
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+        return [dict(r) for r in rows]
+
+    async def get_server_history(self, server_id: str) -> list[dict]:
+        """
+        Returns all state transitions for a server in ascending timestamp order.
+        Raises ValueError if the server does not exist.
+        """
+        async with self._pool.acquire() as conn:
+            exists = await conn.fetchrow(
+                "SELECT server_id FROM servers WHERE server_id = $1", server_id
+            )
+            if exists is None:
+                raise ValueError(f"Server '{server_id}' not found")
+            rows = await conn.fetch(
+                """
+                SELECT * FROM state_transition_history
+                WHERE server_id = $1
+                ORDER BY timestamp ASC
+                """,
+                server_id,
+            )
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
     #  State Reads                                                         #
@@ -207,3 +286,310 @@ class StateManager:
             )
         if result == "UPDATE 0":
             raise ValueError(f"Server '{server_id}' not found")
+
+    # ------------------------------------------------------------------ #
+    #  Manual Overrides (API-only paths — bypass TransitionValidator)      #
+    # ------------------------------------------------------------------ #
+
+    async def reset_server(
+        self,
+        server_id: str,
+        engineer_id: str,
+        reason: str | None = None,
+    ) -> None:
+        """
+        Resets a FAILED server back to PENDING so the migration can be retried.
+
+        Intentionally bypasses TransitionValidator — FAILED has no automated
+        outgoing transitions by design, preventing workers from accidentally
+        restarting a failed migration. Only an engineer calling the API can
+        trigger this path.
+
+        FROZEN servers cannot be reset here. FROZEN means the AWS state is
+        unknown and requires manual inspection before the system touches it.
+
+        Raises ValueError if the server is not found or is not in FAILED state.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT current_state FROM servers WHERE server_id = $1 FOR UPDATE",
+                    server_id,
+                )
+                if row is None:
+                    raise ValueError(f"Server '{server_id}' not found")
+
+                current_state = row["current_state"]
+                if current_state != "FAILED":
+                    raise ValueError(
+                        f"Server '{server_id}' is in state '{current_state}'. "
+                        f"Only FAILED servers can be reset. "
+                        f"FROZEN servers require manual AWS inspection before reset."
+                    )
+
+                await conn.execute(
+                    """
+                    UPDATE servers
+                    SET current_state  = 'PENDING',
+                        previous_state = 'FAILED',
+                        updated_at     = now()
+                    WHERE server_id = $1
+                    """,
+                    server_id,
+                )
+
+                await conn.execute(
+                    """
+                    INSERT INTO state_transition_history
+                        (server_id, from_state, to_state, job_id, job_type, triggered_by, metadata)
+                    VALUES ($1, 'FAILED', 'PENDING', NULL, 'reset', $2, $3)
+                    """,
+                    server_id,
+                    engineer_id,
+                    json.dumps({"reason": reason}) if reason else None,
+                )
+
+    # ------------------------------------------------------------------ #
+    #  Batch Management                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def create_batch(
+        self,
+        batch_id: str,
+        name: str,
+        created_by: str,
+        description: str | None = None,
+    ) -> None:
+        """
+        Creates a new batch record.
+        Raises asyncpg.UniqueViolationError if batch_id already exists.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO batches (batch_id, name, description, created_by)
+                VALUES ($1, $2, $3, $4)
+                """,
+                batch_id,
+                name,
+                description,
+                created_by,
+            )
+
+    async def get_batch(self, batch_id: str) -> dict:
+        """
+        Returns the batch record with an additional server_count field.
+        Raises ValueError if batch_id does not exist.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT b.*,
+                       COUNT(s.server_id) AS server_count
+                FROM batches b
+                LEFT JOIN servers s ON s.batch_id = b.batch_id
+                WHERE b.batch_id = $1
+                GROUP BY b.batch_id
+                """,
+                batch_id,
+            )
+        if row is None:
+            raise ValueError(f"Batch '{batch_id}' not found")
+        return dict(row)
+
+    async def list_batches(self) -> list[dict]:
+        """
+        Returns all batches with server counts, newest first.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT b.*,
+                       COUNT(s.server_id) AS server_count
+                FROM batches b
+                LEFT JOIN servers s ON s.batch_id = b.batch_id
+                GROUP BY b.batch_id
+                ORDER BY b.created_at DESC
+                """
+            )
+        return [dict(r) for r in rows]
+
+    async def add_servers_to_batch(
+        self, batch_id: str, server_ids: list[str]
+    ) -> dict:
+        """
+        Assigns the given server_ids to the batch.
+        Servers not found in the DB land in 'not_found'.
+        Servers already in this batch land in 'already_assigned'.
+        All others are updated to point to this batch ('assigned').
+
+        Does not raise if the batch does not exist — callers must validate first.
+        """
+        if not server_ids:
+            return {"assigned": [], "already_assigned": [], "not_found": []}
+
+        assigned: list[str] = []
+        already_assigned: list[str] = []
+        not_found: list[str] = []
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT server_id, batch_id FROM servers WHERE server_id = ANY($1::text[])",
+                server_ids,
+            )
+            found = {r["server_id"]: r["batch_id"] for r in rows}
+
+            for sid in server_ids:
+                if sid not in found:
+                    not_found.append(sid)
+                elif found[sid] == batch_id:
+                    already_assigned.append(sid)
+                else:
+                    assigned.append(sid)
+
+            if assigned:
+                await conn.execute(
+                    """
+                    UPDATE servers
+                    SET batch_id   = $1,
+                        updated_at = now()
+                    WHERE server_id = ANY($2::text[])
+                    """,
+                    batch_id,
+                    assigned,
+                )
+
+        return {
+            "assigned": assigned,
+            "already_assigned": already_assigned,
+            "not_found": not_found,
+        }
+
+    async def get_batch_servers(self, batch_id: str) -> list[dict]:
+        """
+        Returns all server rows that belong to the given batch.
+        Returns an empty list if no servers are assigned (batch may still exist).
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM servers WHERE batch_id = $1 ORDER BY created_at ASC",
+                batch_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_batch_history(self, batch_id: str) -> list[dict]:
+        """
+        Returns all state transitions for every server in the batch,
+        ordered chronologically. Raises ValueError if batch does not exist.
+        """
+        async with self._pool.acquire() as conn:
+            exists = await conn.fetchrow(
+                "SELECT batch_id FROM batches WHERE batch_id = $1", batch_id
+            )
+            if exists is None:
+                raise ValueError(f"Batch '{batch_id}' not found")
+
+            rows = await conn.fetch(
+                """
+                SELECT h.*
+                FROM state_transition_history h
+                JOIN servers s ON s.server_id = h.server_id
+                WHERE s.batch_id = $1
+                ORDER BY h.timestamp ASC
+                """,
+                batch_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def update_batch_config(
+        self, batch_id: str, config_type: str, config: dict
+    ) -> None:
+        """
+        Stores a config snapshot on the batch record.
+        config_type must be one of: 'replication_config', 'test_launch_config',
+        'cutover_launch_config'.
+        Raises ValueError for unknown config_type or missing batch.
+        """
+        allowed = {"replication_config", "test_launch_config", "cutover_launch_config"}
+        if config_type not in allowed:
+            raise ValueError(f"Unknown config_type '{config_type}'")
+
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                f"""
+                UPDATE batches
+                SET {config_type} = $1::jsonb
+                WHERE batch_id = $2
+                """,
+                json.dumps(config),
+                batch_id,
+            )
+        if result == "UPDATE 0":
+            raise ValueError(f"Batch '{batch_id}' not found")
+
+    # ------------------------------------------------------------------ #
+    #  Global Transition History                                           #
+    # ------------------------------------------------------------------ #
+
+    async def list_transitions(
+        self,
+        server_id: str | None = None,
+        batch_id: str | None = None,
+        from_state: str | None = None,
+        to_state: str | None = None,
+        triggered_by: str | None = None,
+        job_type: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[dict]:
+        """
+        Returns state transitions with composable optional filters.
+        When batch_id is provided, joins to servers to filter by batch.
+        Ordered chronologically (newest first).
+        """
+        conditions: list[str] = []
+        params: list = []
+
+        join = ""
+        if batch_id is not None:
+            join = "JOIN servers s ON s.server_id = h.server_id"
+            params.append(batch_id)
+            conditions.append(f"s.batch_id = ${len(params)}")
+
+        if server_id:
+            params.append(server_id)
+            conditions.append(f"h.server_id = ${len(params)}")
+
+        if from_state:
+            params.append(from_state)
+            conditions.append(f"h.from_state = ${len(params)}")
+
+        if to_state:
+            params.append(to_state)
+            conditions.append(f"h.to_state = ${len(params)}")
+
+        if triggered_by:
+            params.append(triggered_by)
+            conditions.append(f"h.triggered_by = ${len(params)}")
+
+        if job_type:
+            params.append(job_type)
+            conditions.append(f"h.job_type = ${len(params)}")
+
+        if since:
+            params.append(since)
+            conditions.append(f"h.timestamp >= ${len(params)}::timestamptz")
+
+        if until:
+            params.append(until)
+            conditions.append(f"h.timestamp <= ${len(params)}::timestamptz")
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = (
+            f"SELECT h.* FROM state_transition_history h "
+            f"{join} {where} ORDER BY h.timestamp DESC"
+        )
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+        return [dict(r) for r in rows]
