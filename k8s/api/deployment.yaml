@@ -1,0 +1,60 @@
+# k8s/api/deployment.yaml
+#
+# Orchestrator API — the only external interface to the system.
+# Engineers register servers, resolve approval gates, and query audit history
+# exclusively through this service.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator-api
+  namespace: migration-orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator-api
+  template:
+    metadata:
+      labels:
+        app: orchestrator-api
+    spec:
+      containers:
+        - name: orchestrator-api
+          image: migration-orchestrator/api:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            # PostgreSQL
+            - name: PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: username
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+            - name: PG_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: database
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://$(PG_USER):$(PG_PASSWORD)@postgres.migration-orchestrator.svc.cluster.local:5432/$(PG_DATABASE)"
+
+            # RabbitMQ
+            - name: RABBIT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: username
+            - name: RABBIT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: password
+            - name: AMQP_URL
+              value: "amqp://$(RABBIT_USER):$(RABBIT_PASSWORD)@rabbitmq.migration-orchestrator.svc.cluster.local:5672/"

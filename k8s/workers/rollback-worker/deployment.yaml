@@ -1,0 +1,84 @@
+# k8s/workers/rollback-worker/deployment.yaml
+#
+# Consumes from mgn_jobs.failed and poll_jobs.failed (dead-letter queues).
+# Executes the minimum AWS undo actions for each state, then marks the
+# server FAILED (clean) or FROZEN (human intervention required).
+#
+# replicas: 1 — rollback must be serialised per server; a single consumer
+# with prefetch_count=1 ensures one rollback at a time per server.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rollback-worker
+  namespace: migration-orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rollback-worker
+  template:
+    metadata:
+      labels:
+        app: rollback-worker
+    spec:
+      containers:
+        - name: rollback-worker
+          image: migration-orchestrator/workers:latest
+          imagePullPolicy: Never
+          command: ["python", "-m", "workers.run_rollback"]
+          env:
+            # PostgreSQL
+            - name: PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: username
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+            - name: PG_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: database
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://$(PG_USER):$(PG_PASSWORD)@postgres.migration-orchestrator.svc.cluster.local:5432/$(PG_DATABASE)"
+
+            # RabbitMQ
+            - name: RABBIT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: username
+            - name: RABBIT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: password
+            - name: AMQP_URL
+              value: "amqp://$(RABBIT_USER):$(RABBIT_PASSWORD)@rabbitmq.migration-orchestrator.svc.cluster.local:5672/"
+
+            # AWS credentials
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SESSION_TOKEN
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_DEFAULT_REGION

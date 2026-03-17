@@ -18,3 +18,20 @@ def get_mgn_client():
     )
 
 
+def get_ec2_client():
+    """
+    Returns a boto3 client for EC2.
+
+    Used by the Poller Worker to check instance reachability status
+    (2/2 system and instance status checks) before presenting the
+    AWAITING_TEST_VALIDATION and AWAITING_CUTOVER_VALIDATION gates.
+
+    Credentials and region are read from the same environment variables
+    as the MGN client.
+    """
+    return boto3.client(
+        "ec2",
+        region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+    )
+
+

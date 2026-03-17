@@ -188,5 +188,5 @@ Two Alembic migrations extend the original schema — `a3f9c12e8b47` adds `aws_a
 | Poller Worker (all 5 handlers) | Complete |
 | Rollback Worker | Complete |
 | Orchestrator API (FastAPI) | Complete |
-| Dockerfiles + k8s Deployments | Pending |
+| Dockerfiles + k8s Deployments | Complete |
 | End-to-end test | Pending |

@@ -1,0 +1,46 @@
+# k8s/db-migrate/job.yaml
+#
+# One-time Kubernetes Job that runs Alembic migrations before any worker
+# or API pod starts. Run manually after deploying the image:
+#
+#   kubectl apply -f k8s/db-migrate/job.yaml
+#
+# The job uses the workers image and overrides the command to run alembic.
+# alembic.ini lives at /app/src/alembic.ini so alembic finds it relative
+# to the WORKDIR /app/src.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: migration-orchestrator
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: db-migrate
+          image: migration-orchestrator/workers:latest
+          imagePullPolicy: Never
+          command: ["alembic", "upgrade", "head"]
+          env:
+            # Pull individual values from the postgres secret, then compose
+            # the synchronous DATABASE_URL that Alembic's env.py expects.
+            - name: PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: username
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+            - name: PG_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: database
+            - name: DATABASE_URL
+              value: "postgresql://$(PG_USER):$(PG_PASSWORD)@postgres.migration-orchestrator.svc.cluster.local:5432/$(PG_DATABASE)"

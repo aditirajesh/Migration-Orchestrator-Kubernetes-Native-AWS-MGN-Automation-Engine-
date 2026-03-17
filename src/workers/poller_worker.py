@@ -7,7 +7,7 @@ from aio_pika import IncomingMessage, Message, DeliveryMode
 from dispatcher.job_types import JobType, QUEUE_ROUTING
 from workers.poll_result import PollResult, PollStatus
 from workers.state_manager_client import StateManagerClient
-from workers.aws_clients import get_mgn_client
+from workers.aws_clients import get_mgn_client, get_ec2_client
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ class PollerWorker:
         self._connection = None
         self._channel = None
         self._mgn = get_mgn_client()
+        self._ec2 = get_ec2_client()
 
         # Dispatch table: maps each poll job type to its handler function.
         # Adding a new poll type only requires adding an entry here and
@@ -153,6 +154,15 @@ class PollerWorker:
                 await self._reenqueue(body, attempt)
                 await message.ack()
 
+            elif result.status == PollStatus.DISPATCHED:
+                # The handler advanced state and dispatched its own follow-up
+                # poll job. Nothing left for the loop to do except ack.
+                logger.info(
+                    "[poller] %s dispatched follow-up for %s — acking",
+                    job_type.value, server_id,
+                )
+                await message.ack()
+
             elif result.status == PollStatus.FAILED:
                 logger.error(
                     "[poller] %s failed for %s: %s — sending to DLX",
@@ -177,6 +187,31 @@ class PollerWorker:
                 content_type="application/json",
             ),
             routing_key=POLL_QUEUE,
+        )
+
+    async def _dispatch_poll(self, job_type: JobType, payload: dict) -> None:
+        """
+        Dispatch a fresh poll job (attempt=1) with a new payload.
+        Used when a handler transitions between phases — e.g. from polling
+        the MGN job to polling EC2 status checks — where the payload changes
+        and a simple re-enqueue of the same body is not sufficient.
+        """
+        body = {
+            "job_type": job_type.value,
+            "payload":  payload,
+            "attempt":  1,
+        }
+        await self._channel.default_exchange.publish(
+            Message(
+                body=json.dumps(body).encode(),
+                delivery_mode=DeliveryMode.PERSISTENT,
+                content_type="application/json",
+            ),
+            routing_key=POLL_QUEUE,
+        )
+        logger.info(
+            "[poller] Dispatched fresh %s for server %s",
+            job_type.value, payload.get("server_id"),
         )
 
     # ------------------------------------------------------------------
@@ -226,19 +261,72 @@ class PollerWorker:
 
     async def _poll_test_instance_status(self, payload: dict) -> PollResult:
         """
-        Polls the MGN job created by start_test until the test instance is running.
-        When complete, advances through TEST_INSTANCE_RUNNING and immediately sets
-        the AWAITING_TEST_VALIDATION gate so an engineer can validate the instance.
+        Two-phase poll for the test instance.
 
-        AWS call: mgn.describe_jobs
-        Complete when: job.status == "COMPLETED"
-        Failed when:   job.status in ("FAILED", "PARTIALLY_COMPLETED")
+        Phase 1 — MGN job (payload contains mgn_job_id, no ec2_instance_id):
+          Polls describe_jobs until the test launch job completes.
+          On completion, extracts the EC2 instance ID, advances to
+          TEST_INSTANCE_RUNNING, and dispatches a Phase 2 poll with
+          ec2_instance_id in the payload. Returns DISPATCHED so the
+          message loop simply acks without trying to advance state again.
+
+        Phase 2 — EC2 reachability (payload contains ec2_instance_id):
+          Polls describe_instance_status until both the system status check
+          and the instance status check report "ok" (EC2 2/2 checks passed).
+          Only then advances to AWAITING_TEST_VALIDATION — ensuring the
+          engineer never sees the validation gate for an instance that
+          has not yet finished booting.
+
+        Phase 1 AWS call: mgn.describe_jobs
+        Phase 2 AWS call: ec2.describe_instance_status
         """
-        server_id  = payload["server_id"]
-        mgn_job_id = payload.get("mgn_job_id")
+        server_id            = payload["server_id"]
+        ec2_instance_id      = payload.get("ec2_instance_id")
+        aws_source_server_id = payload.get("aws_source_server_id")
 
+        # ── Phase 2: EC2 reachability checks ─────────────────────────────
+        if ec2_instance_id:
+            try:
+                response = self._ec2.describe_instance_status(
+                    InstanceIds=[ec2_instance_id],
+                    IncludeAllInstances=True,
+                )
+                statuses = response.get("InstanceStatuses", [])
+
+                if not statuses:
+                    # Instance not yet visible to describe_instance_status.
+                    return PollResult.in_progress()
+
+                item       = statuses[0]
+                state      = item.get("InstanceState", {}).get("Name", "")
+                sys_check  = item.get("SystemStatus",  {}).get("Status", "")
+                inst_check = item.get("InstanceStatus", {}).get("Status", "")
+
+                logger.debug(
+                    "[poller] Test instance %s — state=%s sys=%s instance=%s",
+                    ec2_instance_id, state, sys_check, inst_check,
+                )
+
+                if state in ("terminated", "stopped"):
+                    return PollResult.failed(
+                        f"Test instance {ec2_instance_id} is in unexpected state '{state}'"
+                    )
+
+                if sys_check == "ok" and inst_check == "ok":
+                    # Both checks passed — the OS is fully booted and reachable.
+                    # Present the validation gate to the engineer.
+                    return PollResult.complete(new_state="AWAITING_TEST_VALIDATION")
+
+                # Still initialising — check again later.
+                return PollResult.in_progress()
+
+            except Exception as e:
+                return PollResult.failed(f"EC2 describe_instance_status error: {e}")
+
+        # ── Phase 1: Poll MGN job until the instance is launched ──────────
+        mgn_job_id = payload.get("mgn_job_id")
         if not mgn_job_id:
-            return PollResult.failed("No mgn_job_id in payload for test instance poll")
+            return PollResult.failed("No mgn_job_id or ec2_instance_id in test instance poll payload")
 
         try:
             response = self._mgn.describe_jobs(filters={"jobIDs": [mgn_job_id]})
@@ -247,17 +335,59 @@ class PollerWorker:
             if not items:
                 return PollResult.failed(f"MGN job {mgn_job_id} not found")
 
-            status = items[0].get("status", "")
+            job    = items[0]
+            status = job.get("status", "")
             logger.debug("[poller] Test launch job %s status: %s", mgn_job_id, status)
 
             if status == "COMPLETED":
-                # Record that the instance is running, then immediately move to the
-                # human validation gate. TEST_INSTANCE_RUNNING has no automated work
-                # to do — it exists to mark the moment in the audit trail.
-                await self._state_manager.advance_state(
-                    server_id, "TEST_INSTANCE_RUNNING", job_type="poll_test_instance_status"
+                # Extract the EC2 instance ID from the job's participating servers.
+                ec2_id = None
+                for participant in job.get("participatingServers", []):
+                    if participant.get("sourceServerID") == aws_source_server_id:
+                        ec2_id = participant.get("launchedEc2InstanceID")
+                        break
+
+                # Fallback: describe_source_servers carries launchedInstance.ec2InstanceID
+                # once MGN has recorded the launch.
+                if not ec2_id and aws_source_server_id:
+                    try:
+                        srv = self._mgn.describe_source_servers(
+                            filters={"sourceServerIDs": [aws_source_server_id]}
+                        )
+                        srv_items = srv.get("items", [])
+                        if srv_items:
+                            ec2_id = srv_items[0].get("launchedInstance", {}).get("ec2InstanceID")
+                    except Exception:
+                        pass
+
+                if not ec2_id:
+                    return PollResult.failed(
+                        f"MGN job {mgn_job_id} completed but EC2 instance ID could not be determined"
+                    )
+
+                logger.info(
+                    "[poller] Test launch job complete for %s — ec2_id=%s, checking reachability",
+                    server_id, ec2_id,
                 )
-                return PollResult.complete(new_state="AWAITING_TEST_VALIDATION")
+
+                # Mark that the instance exists in EC2.
+                await self._state_manager.advance_state(
+                    server_id,
+                    "TEST_INSTANCE_RUNNING",
+                    job_type="poll_test_instance_status",
+                    metadata={"ec2_instance_id": ec2_id},
+                )
+
+                # Dispatch Phase 2: wait for EC2 2/2 status checks.
+                await self._dispatch_poll(
+                    JobType.POLL_TEST_INSTANCE_STATUS,
+                    {
+                        "server_id":            server_id,
+                        "aws_source_server_id": aws_source_server_id,
+                        "ec2_instance_id":      ec2_id,
+                    },
+                )
+                return PollResult.dispatched()
 
             elif status in ("FAILED", "PARTIALLY_COMPLETED"):
                 return PollResult.failed(
@@ -309,17 +439,63 @@ class PollerWorker:
 
     async def _poll_cutover_instance_status(self, payload: dict) -> PollResult:
         """
-        Polls MGN until the cutover instance reaches the CUTOVER lifecycle state,
-        confirming it is fully running. Then immediately sets the
-        AWAITING_CUTOVER_VALIDATION gate for engineer sign-off.
+        Two-phase poll for the cutover (production) instance.
 
-        AWS call: mgn.describe_source_servers
-        Complete when: lifeCycle.state == "CUTOVER" → CUTOVER_INSTANCE_RUNNING → AWAITING_CUTOVER_VALIDATION
-        Failed when:   lifeCycle.state == "DISCONNECTED"
+        Phase 1 — MGN lifecycle (payload has aws_source_server_id, no ec2_instance_id):
+          Polls describe_source_servers until the lifecycle state reaches "CUTOVER",
+          meaning MGN has launched the production instance. Extracts the EC2 instance
+          ID from launchedInstance.ec2InstanceID, advances to CUTOVER_INSTANCE_RUNNING,
+          and dispatches a Phase 2 poll. Returns DISPATCHED.
+
+        Phase 2 — EC2 reachability (payload contains ec2_instance_id):
+          Polls describe_instance_status until both system and instance status checks
+          report "ok" (EC2 2/2 checks passed). Only then sets AWAITING_CUTOVER_VALIDATION
+          so the engineer is presented with a fully booted, reachable production instance.
+
+        Phase 1 AWS call: mgn.describe_source_servers
+        Phase 2 AWS call: ec2.describe_instance_status
         """
         server_id            = payload["server_id"]
         aws_source_server_id = payload["aws_source_server_id"]
+        ec2_instance_id      = payload.get("ec2_instance_id")
 
+        # ── Phase 2: EC2 reachability checks ─────────────────────────────
+        if ec2_instance_id:
+            try:
+                response = self._ec2.describe_instance_status(
+                    InstanceIds=[ec2_instance_id],
+                    IncludeAllInstances=True,
+                )
+                statuses = response.get("InstanceStatuses", [])
+
+                if not statuses:
+                    return PollResult.in_progress()
+
+                item       = statuses[0]
+                state      = item.get("InstanceState", {}).get("Name", "")
+                sys_check  = item.get("SystemStatus",  {}).get("Status", "")
+                inst_check = item.get("InstanceStatus", {}).get("Status", "")
+
+                logger.debug(
+                    "[poller] Cutover instance %s — state=%s sys=%s instance=%s",
+                    ec2_instance_id, state, sys_check, inst_check,
+                )
+
+                if state in ("terminated", "stopped"):
+                    return PollResult.failed(
+                        f"Cutover instance {ec2_instance_id} is in unexpected state '{state}'"
+                    )
+
+                if sys_check == "ok" and inst_check == "ok":
+                    # Both checks passed — production instance is fully booted.
+                    return PollResult.complete(new_state="AWAITING_CUTOVER_VALIDATION")
+
+                return PollResult.in_progress()
+
+            except Exception as e:
+                return PollResult.failed(f"EC2 describe_instance_status error: {e}")
+
+        # ── Phase 1: Poll MGN lifecycle until cutover instance is launched ─
         try:
             response = self._mgn.describe_source_servers(
                 filters={"sourceServerIDs": [aws_source_server_id]}
@@ -329,14 +505,43 @@ class PollerWorker:
             if not items:
                 return PollResult.failed(f"Server {aws_source_server_id} not found in MGN")
 
-            lifecycle_state = items[0].get("lifeCycle", {}).get("state", "")
-            logger.debug("[poller] Cutover instance lifecycle for %s: %s", server_id, lifecycle_state)
+            server_item     = items[0]
+            lifecycle_state = server_item.get("lifeCycle", {}).get("state", "")
+            logger.debug("[poller] Cutover lifecycle for %s: %s", server_id, lifecycle_state)
 
             if lifecycle_state == "CUTOVER":
-                await self._state_manager.advance_state(
-                    server_id, "CUTOVER_INSTANCE_RUNNING", job_type="poll_cutover_instance_status"
+                # MGN has launched the production instance. Get the EC2 instance ID.
+                ec2_id = server_item.get("launchedInstance", {}).get("ec2InstanceID")
+
+                if not ec2_id:
+                    return PollResult.failed(
+                        f"Cutover lifecycle is CUTOVER for {aws_source_server_id} "
+                        f"but EC2 instance ID is not yet available — will retry"
+                    )
+
+                logger.info(
+                    "[poller] Cutover instance launched for %s — ec2_id=%s, checking reachability",
+                    server_id, ec2_id,
                 )
-                return PollResult.complete(new_state="AWAITING_CUTOVER_VALIDATION")
+
+                await self._state_manager.advance_state(
+                    server_id,
+                    "CUTOVER_INSTANCE_RUNNING",
+                    job_type="poll_cutover_instance_status",
+                    metadata={"ec2_instance_id": ec2_id},
+                )
+
+                # Dispatch Phase 2: wait for EC2 2/2 status checks.
+                await self._dispatch_poll(
+                    JobType.POLL_CUTOVER_INSTANCE_STATUS,
+                    {
+                        "server_id":            server_id,
+                        "aws_source_server_id": aws_source_server_id,
+                        "ec2_instance_id":      ec2_id,
+                    },
+                )
+                return PollResult.dispatched()
+
             elif lifecycle_state == "DISCONNECTED":
                 return PollResult.failed(
                     f"Server {aws_source_server_id} unexpectedly disconnected during cutover"

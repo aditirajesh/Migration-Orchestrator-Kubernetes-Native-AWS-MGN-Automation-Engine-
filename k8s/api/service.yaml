@@ -1,0 +1,21 @@
+# k8s/api/service.yaml
+#
+# NodePort service exposing the Orchestrator API on the kind cluster.
+#
+# The kind-cluster.yaml maps containerPort 30800 on the control-plane node
+# to hostPort 8000 on the developer's machine, so the API is reachable at
+# http://localhost:8000 without any kubectl port-forward.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-api
+  namespace: migration-orchestrator
+spec:
+  type: NodePort
+  selector:
+    app: orchestrator-api
+  ports:
+    - port: 80
+      targetPort: 8000
+      nodePort: 30800

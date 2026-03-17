@@ -1,0 +1,24 @@
+# Shared image for mgn-worker, poller-worker, rollback-worker, and the
+# one-time db-migrate Kubernetes Job.
+#
+# Build from the project root:
+#   docker build -f docker/Dockerfile.workers -t migration-orchestrator/workers:latest .
+#
+# The default CMD runs the MGN worker. Override per-deployment:
+#   mgn-worker:      python -m workers.run_mgn
+#   poller-worker:   python -m workers.run_poller
+#   rollback-worker: python -m workers.run_rollback
+#   db-migrate job:  alembic upgrade head
+
+FROM python:3.12-slim
+
+WORKDIR /app/src
+
+# Install dependencies first (cached layer unless requirements.txt changes)
+COPY src/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all source code
+COPY src/ ./
+
+CMD ["python", "-m", "workers.run_mgn"]

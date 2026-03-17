@@ -1,0 +1,80 @@
+# k8s/workers/mgn-worker/deployment.yaml
+#
+# Executes migration actions by calling AWS MGN and EC2 APIs.
+# 2 replicas — RabbitMQ prefetch_count=1 per consumer distributes jobs evenly.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mgn-worker
+  namespace: migration-orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mgn-worker
+  template:
+    metadata:
+      labels:
+        app: mgn-worker
+    spec:
+      containers:
+        - name: mgn-worker
+          image: migration-orchestrator/workers:latest
+          imagePullPolicy: Never
+          command: ["python", "-m", "workers.run_mgn"]
+          env:
+            # PostgreSQL — compose asyncpg URL from secret values
+            - name: PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: username
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+            - name: PG_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: database
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://$(PG_USER):$(PG_PASSWORD)@postgres.migration-orchestrator.svc.cluster.local:5432/$(PG_DATABASE)"
+
+            # RabbitMQ — compose AMQP URL from secret values
+            - name: RABBIT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: username
+            - name: RABBIT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: password
+            - name: AMQP_URL
+              value: "amqp://$(RABBIT_USER):$(RABBIT_PASSWORD)@rabbitmq.migration-orchestrator.svc.cluster.local:5672/"
+
+            # AWS credentials (STS temporary — refresh before demo)
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SESSION_TOKEN
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_DEFAULT_REGION
