@@ -100,14 +100,56 @@ Error states:
 
 ---
 
+## Dockerfiles
+
+Two images cover the entire system:
+
+**`docker/Dockerfile.workers`** — shared image for all three workers and the one-time Alembic migration job. All workers are built from the same codebase and share the same dependencies, so a single image is sufficient. Each Kubernetes deployment overrides the `command` field to run the correct entry point (`run_mgn`, `run_poller`, `run_rollback`). The Alembic migration Job overrides it further to run `alembic upgrade head`.
+
+**`docker/Dockerfile.api`** — separate image for the Orchestrator API. Kept separate so workers and API can be built and versioned independently; a change to the API does not force a workers rebuild.
+
+Both images set `WORKDIR /app/src`. All worker entry points call `sys.path.insert(0, ".")` at startup, which adds the working directory to Python's module search path — placing `WORKDIR` at `src/` makes every package (`workers`, `state_manager`, `dispatcher`, `api`) importable without any additional path manipulation.
+
+---
+
+## Kubernetes Deployments
+
+All components run inside a `migration-orchestrator` namespace. Credentials are never baked into images — they are injected at runtime from Kubernetes Secrets.
+
+| Manifest | Kind | Notes |
+|---|---|---|
+| `k8s/db-migrate/job.yaml` | Job | Runs `alembic upgrade head` once before workers start. Uses `postgresql://` (synchronous) because Alembic does not use asyncpg. `backoffLimit: 3`, `restartPolicy: Never`. |
+| `k8s/workers/mgn-worker/deployment.yaml` | Deployment | 2 replicas. Injects AWS credentials for MGN + EC2 API calls. |
+| `k8s/workers/poller-worker/deployment.yaml` | Deployment | 2 replicas. Injects AWS credentials — the poller calls EC2 `describe_instance_status` for 2/2 reachability checks before advancing to test/cutover validation gates. |
+| `k8s/workers/rollback-worker/deployment.yaml` | Deployment | 1 replica (rollback is serialised per server). Injects AWS credentials for undo actions. |
+| `k8s/api/deployment.yaml` | Deployment | 1 replica. No AWS credentials needed — only talks to RabbitMQ and PostgreSQL. |
+| `k8s/api/service.yaml` | Service (NodePort) | Exposes the API on NodePort 30800. |
+| `k8s/kind-cluster.yaml` | kind config | Maps NodePort 30800 → `localhost:8000` via `extraPortMappings`, so the API is reachable without `kubectl port-forward`. |
+
+Connection URLs (`DATABASE_URL`, `AMQP_URL`) are composed at pod startup using Kubernetes env var substitution — individual secret keys are injected as named env vars, then referenced with `$(VAR_NAME)` to build the full connection string.
+
+---
+
 ## Repository Structure
 
 ```
+docker/
+  Dockerfile.workers  Shared image: mgn-worker, poller-worker, rollback-worker, db-migrate job
+  Dockerfile.api      Orchestrator API image
+
 k8s/
-  rabbitmq/          StatefulSet, services, secret, configmap
-  postgres/          StatefulSet, services, secret
-  aws-credentials/   Kubernetes Secret for AWS STS credentials (placeholder)
-  iam/               IAM policy document for the worker role
+  kind-cluster.yaml   Cluster definition + extraPortMappings (NodePort 30800 → localhost:8000)
+  namespace.yaml      migration-orchestrator namespace
+  rabbitmq/           StatefulSet, services, secret, configmap
+  postgres/           StatefulSet, services, secret
+  aws-credentials/    Kubernetes Secret for AWS STS credentials (placeholder)
+  iam/                IAM policy document for the worker role
+  db-migrate/         One-time Alembic migration Job
+  workers/
+    mgn-worker/       Deployment (2 replicas)
+    poller-worker/    Deployment (2 replicas)
+    rollback-worker/  Deployment (1 replica)
+  api/                Deployment + NodePort Service
 
 src/
   dispatcher/        Job type definitions and queue routing
